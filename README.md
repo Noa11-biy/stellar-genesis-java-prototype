@@ -1,5 +1,8 @@
 <!-- === Fichier: README.md === -->
 
+
+Version Java/jMonkeyEngine clotûrer. Projet poursuivi sous Godot 4 C# : []
+
 # Stellar Genesis
 
 
