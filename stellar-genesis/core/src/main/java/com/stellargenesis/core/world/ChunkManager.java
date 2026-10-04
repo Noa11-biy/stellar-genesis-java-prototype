@@ -1,5 +1,14 @@
 package com.stellargenesis.core.world;
 
+import com.stellargenesis.core.math.Vec3;
+import com.stellargenesis.core.physics.math.AABB;
+import com.stellargenesis.core.physics.math.Frustum;
+import com.stellargenesis.core.world.density.DensityField;
+import com.stellargenesis.core.world.density.DensityFieldGenerator;
+import com.stellargenesis.core.world.meshing.ChunkMesh;
+import com.stellargenesis.core.world.meshing.ChunkMesher;
+
+
 import java.util.Map;
 import java.util.concurrent.*;
 
@@ -33,14 +42,15 @@ public class ChunkManager {
     private final ConcurrentHashMap<ChunkPos, Chunk> loadedChunks;
     private final ExecutorService genPool;
     private final ConcurrentHashMap<ChunkPos, Boolean> pendingGeneration;
-    private final WorldGenerator generator;
+    private final ConcurrentLinkedQueue<ChunkMeshPair> readyToAttach = new ConcurrentLinkedQueue<>();
+    private final DensityFieldGenerator generator;
     private final int renderDistance;
 
     /**
      * @param generator      le générateur de terrain (bruit, biomes...)
      * @param renderDistance  rayon en chunks (8 = 8×16 = 128 blocs)
      */
-    public ChunkManager(WorldGenerator generator, int renderDistance){
+    public ChunkManager(DensityFieldGenerator generator, int renderDistance){
         this.generator = generator;
         this.renderDistance = renderDistance;
         this.loadedChunks = new ConcurrentHashMap<>();
@@ -57,11 +67,18 @@ public class ChunkManager {
          * Les threads sont daemon → ils meurent quand le jeu se ferme,
          * pas besoin de les arrêter manuellement.
          */
-        this.genPool = Executors.newFixedThreadPool(4, r -> {
-            Thread t =new Thread(r, "ChunkGen");
+        java.util.concurrent.ThreadFactory factory = r -> {
+            Thread t = new Thread(r, "ChunkGen");
             t.setDaemon(true);
             return t;
-        });
+        };
+
+        this.genPool = new java.util.concurrent.ThreadPoolExecutor(
+                4, 4,                                                   // corePoolSize = maxPoolSize = 4
+                0L, java.util.concurrent.TimeUnit.MILLISECONDS,         // keepAliveTime (inutile ici)
+                new java.util.concurrent.PriorityBlockingQueue<>(),     // ← LA queue prioritaire
+                factory
+        );
     }
 
     /**
@@ -73,46 +90,73 @@ public class ChunkManager {
      *      - S'il n'est pas chargé et pas en cours de génération → lancer la génération
      *   3. Décharger les chunks trop loin
      */
-    public void update(int playerWorldX, int playerWorldY, int playerWorldZ){
+    public void update(int playerWorldX, int playerWorldY, int playerWorldZ, Frustum frustum){
         ChunkPos center = ChunkPos.fromWorld(playerWorldX, playerWorldY, playerWorldZ);
 
         // --- Étape 1 : Charger les chunks manquants ---
-        requestChunksAround(center);
+        requestChunksAround(center, frustum);
 
         // --- Étape 2 : Décharger les chunks hors rayon ---
         unloadDistantChunks(center);
     }
 
     /**
-     * Parcourir le cube de rendu autour du joueur.
-     *
-     * Le cube va de (center - renderDistance) à (center + renderDistance)
-     * sur les 3 axes. Pour renderDistance=8, ça fait 17³ = 4913 positions
-     * à vérifier. Mais la plupart sont déjà chargées → le check est rapide
-     * grâce à ConcurrentHashMap.containsKey() en O(1).
+     * Demande la génération des chunks autour d'un point central.
+     * Chaque chunk reçoit une priorité selon :
+     *   - sa visibilité dans le frustum
+     *   - sa distance au joueur
      */
-    private void requestChunksAround(ChunkPos center){
+    private void requestChunksAround(ChunkPos center, Frustum frustum) {
         for (int dx = -renderDistance; dx <= renderDistance; dx++) {
-            for (int dy = -renderDistance; dy <= renderDistance; dy++) {
-                for (int dz = -renderDistance; dz < renderDistance; dz++) {
-                    ChunkPos pos = new ChunkPos(
-                            center.x + dx,
-                            center.y + dy,
-                            center.z + dz
-                    );
+            for (int dz = -renderDistance; dz <= renderDistance; dz++) {
+                for (int dy = -2; dy <= 4; dy++) {
+                    ChunkPos pos = new ChunkPos(center.x + dx, center.y + dy, center.z + dz);
 
-                    // Déjà chargé ? → rien à faire
                     if (loadedChunks.containsKey(pos)) continue;
-
-                    // Déjà en cours de génération ? → pas de doublon
                     if (pendingGeneration.containsKey(pos)) continue;
 
-                    // Lancer la génération asynchrone
+                    // --- Calcul de la priorité ---
+                    int priority = computePriority(pos, center, frustum);
+
                     pendingGeneration.put(pos, Boolean.TRUE);
-                    genPool.submit(() -> generateAsync(pos));
+                    genPool.execute(new PrioritizedChunkTask(priority, () -> generateAsync(pos)));
                 }
             }
         }
+    }
+
+    /**
+     * Calcule la priorité d'un chunk.
+     *   plus petit = plus urgent
+     *   visibles (0-999) passent avant invisibles (1000+)
+     */
+    private int computePriority(ChunkPos pos, ChunkPos center, Frustum frustum){
+        // 1. Distance au joueur en chunks (Manhattan = rapide, pas besoin de sqrt)
+        int distance = Math.abs(pos.x - center.x)
+                + Math.abs(pos.y - center.y)
+                + Math.abs(pos.z - center.z);
+
+        // 2. Visibilité dans le frustum
+        boolean visible;
+        if (frustum == null) {
+            // Pas de frustum (démarrage) → tout est traité comme visible
+            visible = true;
+        } else {
+            Vec3 min = new Vec3(
+                    pos.x * Chunk.SIZE,
+                    pos.y * Chunk.SIZE,
+                    pos.z * Chunk.SIZE
+            );
+            Vec3 max = new Vec3(
+                    min.x + Chunk.SIZE,
+                    min.y + Chunk.SIZE,
+                    min.z + Chunk.SIZE
+            );
+            visible = frustum.intersects(new AABB(min, max));
+        }
+
+        // 3. Combinaison : visibles (0-999) avant invisibles (1000+)
+        return (visible ? 0 : 1000) + distance;
     }
 
     /**
@@ -122,16 +166,72 @@ public class ChunkManager {
      * C'est pour ça qu'on utilise ConcurrentHashMap :
      * ce code tourne en parallèle du rendu.
      */
-    private void generateAsync(ChunkPos pos){
-        try{
+    private void generateAsync(ChunkPos pos) {
+        try {
+            // 1. Créer le chunk
             Chunk chunk = new Chunk(pos);
-            generator.generateChunk(chunk);
-            chunk.markDirty(); // Le mesh doit être construit
 
+            // 2. Générer le champ de densité directement DANS le chunk
+            //    subtilité : DensityFieldGenerator.generate() retourne un NOUVEAU
+            //    DensityField, alors que Chunk en a déjà un en interne.
+            //    → voir note ci-dessous
+            DensityField generated = generator.generate(pos.x, pos.y, pos.z);
+
+            // → on copie le contenu dans le DensityField du chunk
+            //    (ou alternative : on adapte Chunk pour accepter un DensityField externe)
+            copyDensity(generated, chunk.getDensityField());
+
+            chunk.markGenerated();
             loadedChunks.put(pos, chunk);
+
+            // 3. Mesher
+            ChunkMesh chunkMesh = ChunkMesher.mesh(chunk.getDensityField());
+
+            // 4. Si le mesh n'est pas vide, le pousser TEL QUEL (pas de conversion)
+            if (chunkMesh != null && chunkMesh.getVertices().length > 0) {
+                readyToAttach.add(new ChunkMeshPair(pos, chunk, chunkMesh));
+            }
+
+            // 5. Re-mesher les voisins
+            remeshNeighbors(pos);
+
         } finally {
-            // Toujours retirer de pending, même en cas d'erreur
             pendingGeneration.remove(pos);
+        }
+    }
+
+    private static void copyDensity(DensityField src, DensityField dst) {
+        int size = src.getSize();
+        for (int z = 0; z < size; z++) {
+            for (int y = 0; y < size; y++) {
+                for (int x = 0; x < size; x++) {
+                    dst.set(x, y, z, src.get(x, y, z));
+                }
+            }
+        }
+    }
+
+    private void remeshNeighbors(ChunkPos pos) {
+        int[][] neighborOffsets = {
+                {1,0,0}, {-1,0,0},
+                {0,1,0}, {0,-1,0},
+                {0,0,1}, {0,0,-1}
+        };
+
+        for (int[] offset : neighborOffsets) {
+            ChunkPos neighborPos = new ChunkPos(
+                    pos.x + offset[0],
+                    pos.y + offset[1],
+                    pos.z + offset[2]
+            );
+
+            Chunk neighbor = loadedChunks.get(neighborPos);
+            if (neighbor == null) continue; // pas encore chargé, pas grave
+
+            ChunkMesh chunkMesh = ChunkMesher.mesh(neighbor.getDensityField());
+            if (chunkMesh != null && chunkMesh.getVertices().length > 0) {
+                readyToAttach.add(new ChunkMeshPair(neighborPos, neighbor, chunkMesh));
+            }
         }
     }
 
@@ -172,35 +272,6 @@ public class ChunkManager {
     }
 
     /**
-     * Lire un bloc dans le monde.
-     * Trouve le bon chunk puis lit la position locale.
-     * Retourne 0 (air) si le chunk n'est pas chargé.
-     */
-    public short getBlock(int wx, int wy, int wz){
-        Chunk chunk = getChunkAt(wx, wy, wz);
-        if (chunk == null) return 0;
-
-        int lx = wx & 0xF;     // modulo 16 par masque binaire
-        int ly = wy & 0xF;
-        int lz = wz & 0xF;
-        return chunk.getBlock(lx, ly, lz);
-    }
-
-    /**
-     * Placer un bloc dans le monde.
-     * Trouve le bon chunk et modifie la position locale.
-     */
-    public void setBlock(int wx, int wy, int wz, short blockId){
-        Chunk chunk = getChunkAt(wx, wy, wz);
-        if (chunk == null) return;
-
-        int lx = wx & 0xF;
-        int ly = wy & 0xF;
-        int lz = wz & 0xF;
-        chunk.setBlock(lx, ly, lz, blockId);
-    }
-
-    /**
      * Récupérer les chunks dirty (mesh à reconstruire).
      * Appelé par le renderer pour savoir quels meshes mettre à jour.
      */
@@ -226,17 +297,31 @@ public class ChunkManager {
     /**
      * Récupère un chunk s'il est chargé, sinon le génère.
      */
-    public Chunk getOrGenerate(ChunkPos pos) {
-        return loadedChunks.computeIfAbsent(pos, p -> {
-            Chunk chunk = new Chunk(p);
-            generator.generateChunk(chunk);
-            return chunk;
-        });
+//    public Chunk getOrGenerate(ChunkPos pos) {
+//        return loadedChunks.computeIfAbsent(pos, p -> {
+//            Chunk chunk = new Chunk(p);
+//            generator.generateChunk(chunk);
+//            return chunk;
+//        });
+//    }
+
+    /**
+     * Insérer un chunk directement dans la map (spawn synchrone).
+     * Utilisé UNIQUEMENT pour findTerrainHeight au démarrage.
+     */
+    public void forceInsert(ChunkPos pos, Chunk chunk) {
+        loadedChunks.put(pos, chunk);
     }
+
 
     public int getRenderDistance() {
         return renderDistance;
     }
+
+    public ConcurrentLinkedQueue<ChunkMeshPair> getReadyQueue() {
+        return readyToAttach;
+    }
+
 
     /**
      * Arrêter proprement le pool de génération.
@@ -254,4 +339,5 @@ public class ChunkManager {
         }
     }
 
+    public record ChunkMeshPair(ChunkPos pos, Chunk chunk, ChunkMesh mesh) {}
 }
